@@ -145,6 +145,37 @@ class Path(Base):
 
 
 # =============================================================================
+# Change Collector
+# =============================================================================
+
+
+class ChangeCollector:
+    """Accumulates serialized row data before mutations for changeset recording.
+
+    Passed optionally through the operation layers so that each delete
+    primitive can record pre-deletion state without coupling the "what to
+    record" concern into the "what to delete" logic.
+    """
+
+    def __init__(self):
+        self.nodes: List[Dict[str, Any]] = []
+        self.memories: List[Dict[str, Any]] = []
+        self.edges: List[Dict[str, Any]] = []
+        self.paths: List[Dict[str, Any]] = []
+
+    def record(self, table: str, row_data: Dict[str, Any]):
+        getattr(self, table).append(row_data)
+
+    def to_dict(self) -> Dict[str, list]:
+        return {
+            "nodes": self.nodes,
+            "memories": self.memories,
+            "edges": self.edges,
+            "paths": self.paths,
+        }
+
+
+# =============================================================================
 # SQLite Client
 # =============================================================================
 
@@ -632,91 +663,155 @@ class SQLiteClient:
             return {table: [self._serialize_row(r) for r in result.scalars().all()]}
 
     # =========================================================================
-    # Create Operations
+    # Layer 0: Row-Level Primitives
+    # Single-row / single-table. Takes session, never opens own transaction.
     # =========================================================================
 
-    async def create_memory(
+    async def _ensure_node(
+        self, session: AsyncSession, node_uuid: str
+    ) -> Node:
+        """Create a node if it doesn't exist; return it either way."""
+        result = await session.execute(
+            select(Node).where(Node.uuid == node_uuid)
+        )
+        node = result.scalar_one_or_none()
+        if node:
+            return node
+        node = Node(uuid=node_uuid)
+        session.add(node)
+        await session.flush()
+        return node
+
+    async def _insert_memory(
         self,
-        parent_path: str,
+        session: AsyncSession,
+        node_uuid: str,
         content: str,
-        priority: int,
-        title: Optional[str] = None,
+        *,
+        deprecated: bool = False,
+    ) -> Memory:
+        """Insert a new memory row and flush to obtain its ID."""
+        memory = Memory(
+            content=content,
+            node_uuid=node_uuid,
+            deprecated=deprecated,
+        )
+        session.add(memory)
+        await session.flush()
+        return memory
+
+    async def _get_or_create_edge(
+        self,
+        session: AsyncSession,
+        parent_uuid: str,
+        child_uuid: str,
+        name: str,
+        priority: int = 0,
         disclosure: Optional[str] = None,
-        domain: str = "core",
-    ) -> Dict[str, Any]:
-        """
-        Create a new memory under a parent path.
+    ) -> tuple:
+        """Get an existing edge or create a new one.
 
-        Creates: Node → Memory → Edge (parent→child) → Path.
+        Returns (edge, created: bool).
         """
-        async with self.session() as session:
-            # Resolve parent node UUID
-            if parent_path:
-                parent_result = await session.execute(
-                    select(Edge.child_uuid)
-                    .select_from(Path)
-                    .join(Edge, Path.edge_id == Edge.id)
-                    .where(Path.domain == domain)
-                    .where(Path.path == parent_path)
-                )
-                parent_row = parent_result.first()
-                if not parent_row:
-                    raise ValueError(
-                        f"Parent '{domain}://{parent_path}' does not exist. "
-                        f"Create the parent first, or use '{domain}://' as root."
+        result = await session.execute(
+            select(Edge).where(
+                Edge.parent_uuid == parent_uuid,
+                Edge.child_uuid == child_uuid,
+            )
+        )
+        edge = result.scalar_one_or_none()
+        if edge:
+            return edge, False
+
+        edge = Edge(
+            parent_uuid=parent_uuid,
+            child_uuid=child_uuid,
+            name=name,
+            priority=priority,
+            disclosure=disclosure,
+        )
+        session.add(edge)
+        await session.flush()
+        return edge, True
+
+    async def _insert_path(
+        self, session: AsyncSession, domain: str, path: str, edge_id: int
+    ) -> Path:
+        """Insert a new path row."""
+        path_obj = Path(domain=domain, path=path, edge_id=edge_id)
+        session.add(path_obj)
+        return path_obj
+
+    async def _resolve_path(
+        self, session: AsyncSession, path: str, domain: str = "core"
+    ) -> Optional[tuple[Path, Edge, str]]:
+        """Resolve domain+path to (Path, Edge, node_uuid). Returns None if not found."""
+        result = await session.execute(
+            select(Path, Edge)
+            .join(Edge, Path.edge_id == Edge.id)
+            .where(Path.domain == domain, Path.path == path)
+        )
+        row = result.first()
+        if not row:
+            return None
+        path_obj, edge = row
+        return path_obj, edge, edge.child_uuid
+
+    async def _count_paths_for_edge(
+        self, session: AsyncSession, edge_id: int
+    ) -> int:
+        """Count how many path rows reference a given edge."""
+        result = await session.execute(
+            select(func.count())
+            .select_from(Path)
+            .where(Path.edge_id == edge_id)
+        )
+        return result.scalar()
+
+    async def _count_incoming_paths(
+        self,
+        session: AsyncSession,
+        node_uuid: str,
+        *,
+        exclude_domain: Optional[str] = None,
+        exclude_path_prefix: Optional[str] = None,
+    ) -> int:
+        """Count paths whose edge points TO this node (edge.child_uuid)."""
+        stmt = (
+            select(func.count())
+            .select_from(Path)
+            .join(Edge, Path.edge_id == Edge.id)
+            .where(Edge.child_uuid == node_uuid)
+        )
+
+        if exclude_domain and exclude_path_prefix:
+            safe_prefix = (
+                exclude_path_prefix.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            stmt = stmt.where(
+                not_(
+                    and_(
+                        Path.domain == exclude_domain,
+                        Path.path.like(f"{safe_prefix}/%", escape="\\"),
                     )
-                parent_uuid = parent_row[0]
-            else:
-                parent_uuid = ROOT_NODE_UUID
-
-            # Determine final path
-            if title:
-                final_path = f"{parent_path}/{title}" if parent_path else title
-            else:
-                next_num = await self._get_next_child_number(session, parent_uuid)
-                final_path = (
-                    f"{parent_path}/{next_num}" if parent_path else str(next_num)
                 )
-
-            # Check path collision
-            existing = await session.execute(
-                select(Path).where(Path.domain == domain).where(Path.path == final_path)
             )
-            if existing.scalar_one_or_none():
-                raise ValueError(f"Path '{domain}://{final_path}' already exists")
 
-            # Create node
-            new_uuid = str(uuid_lib.uuid4())
-            session.add(Node(uuid=new_uuid))
+        result = await session.execute(stmt)
+        return result.scalar()
 
-            # Create memory
-            memory = Memory(content=content, node_uuid=new_uuid)
-            session.add(memory)
-            await session.flush()
-
-            # Create edge
-            edge_name = title if title else final_path.rsplit("/", 1)[-1]
-            edge = Edge(
-                parent_uuid=parent_uuid,
-                child_uuid=new_uuid,
-                name=edge_name,
-                priority=priority,
-                disclosure=disclosure,
-            )
-            session.add(edge)
-            await session.flush()
-
-            # Create path
-            session.add(Path(domain=domain, path=final_path, edge_id=edge.id))
-
-            return {
-                "id": memory.id,
-                "node_uuid": new_uuid,
-                "domain": domain,
-                "path": final_path,
-                "uri": f"{domain}://{final_path}",
-                "priority": priority,
-            }
+    async def _count_memories_for_node(
+        self, session: AsyncSession, node_uuid: str
+    ) -> int:
+        """Count all memory rows (including deprecated) for a node."""
+        result = await session.execute(
+            select(func.count())
+            .select_from(Memory)
+            .where(Memory.node_uuid == node_uuid)
+        )
+        return result.scalar()
 
     async def _get_next_child_number(
         self, session: AsyncSession, parent_uuid: str
@@ -733,269 +828,6 @@ class SQLiteClient:
             except ValueError:
                 pass
         return max_num + 1
-
-    # =========================================================================
-    # Update Operations
-    # =========================================================================
-
-    async def update_memory(
-        self,
-        path: str,
-        content: Optional[str] = None,
-        priority: Optional[int] = None,
-        disclosure: Optional[str] = None,
-        domain: str = "core",
-    ) -> Dict[str, Any]:
-        """
-        Update a memory.
-
-        Content change → new Memory row with the same node_uuid (no path repointing).
-        Metadata change → update the Edge directly.
-        """
-        if content is None and priority is None and disclosure is None:
-            raise ValueError(
-                f"No update fields provided for '{domain}://{path}'. "
-                "At least one of content, priority, or disclosure must be set."
-            )
-
-        async with self.session() as session:
-            result = await session.execute(
-                select(Memory, Edge, Path)
-                .select_from(Path)
-                .join(Edge, Path.edge_id == Edge.id)
-                .join(
-                    Memory,
-                    and_(
-                        Memory.node_uuid == Edge.child_uuid,
-                        Memory.deprecated == False,
-                    ),
-                )
-                .where(Path.domain == domain)
-                .where(Path.path == path)
-                .order_by(Memory.created_at.desc())
-                .limit(1)
-            )
-            row = result.first()
-
-            if not row:
-                raise ValueError(
-                    f"Path '{domain}://{path}' not found or memory is deprecated"
-                )
-
-            old_memory, edge, path_obj = row
-            old_id = old_memory.id
-            node_uuid = edge.child_uuid
-
-            # Update edge metadata
-            if priority is not None:
-                edge.priority = priority
-                session.add(edge)
-            if disclosure is not None:
-                edge.disclosure = disclosure
-                session.add(edge)
-
-            new_memory_id = old_id
-
-            if content is not None:
-                # New version on the same node — no path repointing needed
-                new_memory = Memory(content=content, node_uuid=node_uuid)
-                session.add(new_memory)
-                await session.flush()
-                new_memory_id = new_memory.id
-
-                # Deprecate all currently active old memories for this node (cleans up any dirty data)
-                await session.execute(
-                    update(Memory)
-                    .where(
-                        and_(
-                            Memory.node_uuid == node_uuid,
-                            Memory.deprecated == False,
-                            Memory.id != new_memory_id,
-                        )
-                    )
-                    .values(deprecated=True, migrated_to=new_memory_id)
-                )
-
-            if content is None:
-                session.add(path_obj)
-
-            return {
-                "domain": domain,
-                "path": path,
-                "uri": f"{domain}://{path}",
-                "old_memory_id": old_id,
-                "new_memory_id": new_memory_id,
-                "node_uuid": node_uuid,
-            }
-
-    async def rollback_to_memory(
-        self, path: str, target_memory_id: int, domain: str = "core"
-    ) -> Dict[str, Any]:
-        """
-        Rollback a path to point to a specific memory version.
-
-        In the graph model this simply deprecates the current Memory row
-        and un-deprecates the target — no path repointing needed.
-        """
-        async with self.session() as session:
-            path_node_result = await session.execute(
-                select(Edge.child_uuid)
-                .select_from(Path)
-                .join(Edge, Path.edge_id == Edge.id)
-                .where(Path.domain == domain)
-                .where(Path.path == path)
-            )
-            path_node_uuid = path_node_result.scalar_one_or_none()
-            if path_node_uuid is None:
-                raise ValueError(f"Path '{domain}://{path}' not found")
-
-            target_row = await session.execute(
-                select(Memory).where(Memory.id == target_memory_id)
-            )
-            target_memory = target_row.scalar_one_or_none()
-            if not target_memory:
-                raise ValueError(f"Target memory ID {target_memory_id} not found")
-            if target_memory.node_uuid != path_node_uuid:
-                raise ValueError(
-                    f"Target memory ID {target_memory_id} does not belong to "
-                    f"'{domain}://{path}'"
-                )
-
-            await session.execute(
-                update(Memory)
-                .where(
-                    and_(
-                        Memory.node_uuid == path_node_uuid,
-                        Memory.deprecated == False,
-                        Memory.id != target_memory_id,
-                    )
-                )
-                .values(deprecated=True, migrated_to=target_memory_id)
-            )
-
-            await session.execute(
-                update(Memory)
-                .where(Memory.id == target_memory_id)
-                .values(deprecated=False, migrated_to=None)
-            )
-
-            return {
-                "domain": domain,
-                "path": path,
-                "uri": f"{domain}://{path}",
-                "restored_memory_id": target_memory_id,
-            }
-
-    # =========================================================================
-    # Path / Edge Operations
-    # =========================================================================
-
-    async def add_path(
-        self,
-        new_path: str,
-        target_path: str,
-        new_domain: str = "core",
-        target_domain: str = "core",
-        priority: int = 0,
-        disclosure: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Create an alias path pointing to the same node as target_path.
-
-        Also cascades: automatically creates sub-paths for all descendants.
-        """
-        async with self.session() as session:
-            # Resolve target → node_uuid
-            target_result = await session.execute(
-                select(Edge.child_uuid)
-                .select_from(Path)
-                .join(Edge, Path.edge_id == Edge.id)
-                .where(Path.domain == target_domain)
-                .where(Path.path == target_path)
-            )
-            target_row = target_result.first()
-            if not target_row:
-                raise ValueError(
-                    f"Target path '{target_domain}://{target_path}' not found"
-                )
-            target_node_uuid = target_row[0]
-
-            # Resolve new_path's parent → node_uuid
-            if "/" in new_path:
-                parent_path = new_path.rsplit("/", 1)[0]
-                parent_result = await session.execute(
-                    select(Edge.child_uuid)
-                    .select_from(Path)
-                    .join(Edge, Path.edge_id == Edge.id)
-                    .where(Path.domain == new_domain)
-                    .where(Path.path == parent_path)
-                )
-                parent_row = parent_result.first()
-                if not parent_row:
-                    raise ValueError(
-                        f"Parent '{new_domain}://{parent_path}' does not exist. "
-                        f"Create the parent first, or use a shallower alias path."
-                    )
-                parent_uuid = parent_row[0]
-            else:
-                parent_uuid = ROOT_NODE_UUID
-
-            # Check collision
-            existing = await session.execute(
-                select(Path)
-                .where(Path.domain == new_domain)
-                .where(Path.path == new_path)
-            )
-            if existing.scalar_one_or_none():
-                raise ValueError(f"Path '{new_domain}://{new_path}' already exists")
-
-            # Cycle check: reject if target_node is an ancestor of parent
-            if await self._would_create_cycle(
-                session, parent_uuid, target_node_uuid
-            ):
-                raise ValueError(
-                    f"Cannot create alias '{new_domain}://{new_path}': "
-                    f"target node is an ancestor of the destination parent, "
-                    f"which would create a cycle in the graph."
-                )
-
-            # Get or create edge
-            edge_name = new_path.rsplit("/", 1)[-1]
-            edge_result = await session.execute(
-                select(Edge).where(
-                    Edge.parent_uuid == parent_uuid,
-                    Edge.child_uuid == target_node_uuid,
-                )
-            )
-            edge = edge_result.scalar_one_or_none()
-            edge_created = edge is None
-
-            if edge_created:
-                edge = Edge(
-                    parent_uuid=parent_uuid,
-                    child_uuid=target_node_uuid,
-                    name=edge_name,
-                    priority=priority,
-                    disclosure=disclosure,
-                )
-                session.add(edge)
-                await session.flush()
-
-            # Create the primary path
-            session.add(Path(domain=new_domain, path=new_path, edge_id=edge.id))
-
-            # Cascade: create sub-paths for all descendants
-            await self._cascade_create_paths(
-                session, target_node_uuid, new_domain, new_path
-            )
-
-            return {
-                "new_uri": f"{new_domain}://{new_path}",
-                "target_uri": f"{target_domain}://{target_path}",
-                "node_uuid": target_node_uuid,
-                "edge_id": edge.id,
-                "edge_created": edge_created,
-            }
 
     async def _would_create_cycle(
         self,
@@ -1028,6 +860,93 @@ class SQLiteClient:
                     visited.add(next_uuid)
                     queue.append(next_uuid)
         return False
+
+    # =========================================================================
+    # Layer 1: Table-Scoped Operations
+    # Multi-row ops within a single table or closely related tables.
+    # =========================================================================
+
+    async def _deprecate_node_memories(
+        self,
+        session: AsyncSession,
+        node_uuid: str,
+        *,
+        successor_id: Optional[int] = None,
+    ) -> List[int]:
+        """Mark active memories for a node as deprecated.
+
+        Args:
+            successor_id: Value for migrated_to (None = orphan deprecation).
+                When provided, that row is excluded from deprecation.
+
+        Returns list of deprecated memory IDs.
+        """
+        conditions = [
+            Memory.node_uuid == node_uuid,
+            Memory.deprecated == False,
+        ]
+        if successor_id is not None:
+            conditions.append(Memory.id != successor_id)
+
+        result = await session.execute(
+            select(Memory.id).where(and_(*conditions))
+        )
+        ids = [row[0] for row in result.all()]
+
+        if ids:
+            await session.execute(
+                update(Memory)
+                .where(Memory.id.in_(ids))
+                .values(deprecated=True, migrated_to=successor_id)
+            )
+        return ids
+
+    async def _safely_delete_memory(
+        self,
+        session: AsyncSession,
+        memory_id: int,
+        *,
+        require_deprecated: bool = False,
+    ) -> Dict[str, Any]:
+        """Safely delete one memory row with chain repair.
+
+        Steps:
+        1) Validate target existence (and deprecated-only requirement if requested).
+        2) Repair predecessor pointers: migrated_to == memory_id -> successor_id.
+        3) Delete the target memory row.
+        """
+        target_result = await session.execute(
+            select(Memory).where(Memory.id == memory_id)
+        )
+        target = target_result.scalar_one_or_none()
+        if not target:
+            raise ValueError(f"Memory ID {memory_id} not found")
+
+        if require_deprecated and not target.deprecated:
+            raise PermissionError(
+                f"Memory {memory_id} is active "
+                f"(deprecated=False). Deletion aborted."
+            )
+
+        successor_id = target.migrated_to
+        await session.execute(
+            update(Memory)
+            .where(Memory.migrated_to == memory_id)
+            .values(migrated_to=successor_id)
+        )
+
+        result = await session.execute(
+            delete(Memory).where(Memory.id == memory_id)
+        )
+        if result.rowcount == 0:
+            raise ValueError(f"Memory ID {memory_id} not found")
+
+        return {
+            "deleted_memory_id": memory_id,
+            "chain_repaired_to": successor_id,
+            "node_uuid": target.node_uuid,
+            "was_active": not target.deprecated,
+        }
 
     async def _cascade_create_paths(
         self,
@@ -1068,193 +987,92 @@ class SQLiteClient:
         finally:
             _visited.remove(node_uuid)
 
-    async def _delete_edge_if_pathless(
+    # =========================================================================
+    # Layer 2: Cross-Table Cascades
+    # Deterministic multi-table operations. No condition checks.
+    # =========================================================================
+
+    async def _delete_subtree_paths(
+        self,
+        session: AsyncSession,
+        domain: str,
+        path: str,
+        *,
+        collector: Optional[ChangeCollector] = None,
+    ) -> List[Dict[str, Any]]:
+        """Delete a path and all its descendant paths in the given domain.
+
+        Returns serialized representations of deleted Path rows.
+        """
+        safe = (
+            path.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        result = await session.execute(
+            select(Path)
+            .where(Path.domain == domain)
+            .where(
+                or_(
+                    Path.path == path,
+                    Path.path.like(f"{safe}/%", escape="\\"),
+                )
+            )
+        )
+        paths = result.scalars().all()
+
+        deleted: List[Dict[str, Any]] = []
+        for p in paths:
+            serialized = self._serialize_row(p)
+            deleted.append(serialized)
+            if collector:
+                collector.record("paths", serialized)
+            await session.delete(p)
+        return deleted
+
+    async def _cascade_delete_edge(
         self,
         session: AsyncSession,
         edge: Edge,
         *,
-        snapshot: Optional[Dict[str, list]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Delete an edge if it has no remaining path references.
-
-        Returns edge info dict if deleted, None otherwise.
-        When *snapshot* is provided, appends the serialized edge row
-        before deletion so the caller can record it in the changeset.
-        """
-        remaining = await session.execute(
-            select(func.count())
-            .select_from(Path)
-            .where(Path.edge_id == edge.id)
+        collector: Optional[ChangeCollector] = None,
+    ) -> Dict[str, Any]:
+        """Delete an edge, all its path references, and descendant paths."""
+        paths_result = await session.execute(
+            select(Path).where(Path.edge_id == edge.id)
         )
-        if remaining.scalar() == 0:
-            if snapshot is not None:
-                snapshot.setdefault("edges", []).append(self._serialize_row(edge))
-            info = {
-                "edge_id": edge.id,
-                "parent_uuid": edge.parent_uuid,
-                "child_uuid": edge.child_uuid,
-                "name": edge.name,
-                "priority": edge.priority,
-                "disclosure": edge.disclosure,
-            }
-            await session.delete(edge)
-            return info
-        return None
+        edge_paths = paths_result.scalars().all()
 
-    async def _gc_unreachable_node_edges(
-        self,
-        session: AsyncSession,
-        node_uuid: str,
-        *,
-        snapshot: Optional[Dict[str, list]] = None,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """GC all edges (and dangling paths) around an unreachable node.
-
-        If the node still has at least one reachable path, returns
-        immediately with empty lists.
-
-        Otherwise:
-        - Incoming edges are all pathless by definition (if any had a
-          path, the node would be reachable), so they are deleted.
-        - Outgoing edges are force-deleted along with any remaining
-          path references, since those paths are dangling (their
-          parent node is unreachable).
-        - Active memories on this node are marked deprecated (with
-          migrated_to=None to distinguish from version-chain
-          deprecation).  restore_path already handles un-deprecating.
-
-        When *snapshot* is provided, serialized row data is appended
-        before each deletion for changeset recording.
-
-        Returns {"edges": [...], "paths": [...], "deprecated_memories": [...]}.
-        """
-        remaining = await session.execute(
-            select(func.count())
-            .select_from(Path)
-            .join(Edge, Path.edge_id == Edge.id)
-            .where(Edge.child_uuid == node_uuid)
-        )
-        if remaining.scalar() > 0:
-            return {"edges": [], "paths": [], "deprecated_memories": []}
-
-        deleted_edges: List[Dict[str, Any]] = []
         deleted_paths: List[Dict[str, Any]] = []
-
-        incoming_result = await session.execute(
-            select(Edge).where(Edge.child_uuid == node_uuid)
-        )
-        for edge in incoming_result.scalars().all():
-            info = await self._delete_edge_if_pathless(
-                session, edge, snapshot=snapshot
-            )
-            if info:
-                deleted_edges.append(info)
-
-        outgoing_result = await session.execute(
-            select(Edge).where(Edge.parent_uuid == node_uuid)
-        )
-        for edge in outgoing_result.scalars().all():
-            paths_result = await session.execute(
-                select(Path).where(Path.edge_id == edge.id)
-            )
-            paths = paths_result.scalars().all()
-            if paths:
-                mem_result = await session.execute(
-                    select(Memory)
-                    .where(
-                        Memory.node_uuid == edge.child_uuid, Memory.deprecated == False
-                    )
+        for p in edge_paths:
+            deleted_paths.extend(
+                await self._delete_subtree_paths(
+                    session, p.domain, p.path, collector=collector
                 )
-                memory = mem_result.scalar_one_or_none()
-                mem_id = memory.id if memory else None
-                if memory and snapshot is not None:
-                    snapshot.setdefault("memories", []).append(
-                        self._serialize_row(memory)
-                    )
-
-                for p in paths:
-                    if snapshot is not None:
-                        snapshot.setdefault("paths", []).append(
-                            self._serialize_row(p)
-                        )
-                    deleted_paths.append(
-                        {
-                            "domain": p.domain,
-                            "path": p.path,
-                            "edge_id": p.edge_id,
-                            "uri": f"{p.domain}://{p.path}",
-                            "node_uuid": edge.child_uuid,
-                            "memory_id": mem_id,
-                            "priority": edge.priority,
-                            "disclosure": edge.disclosure,
-                        }
-                    )
-                    await session.delete(p)
-
-            if snapshot is not None:
-                snapshot.setdefault("edges", []).append(
-                    self._serialize_row(edge)
-                )
-            deleted_edges.append(
-                {
-                    "edge_id": edge.id,
-                    "parent_uuid": edge.parent_uuid,
-                    "child_uuid": edge.child_uuid,
-                    "name": edge.name,
-                    "priority": edge.priority,
-                    "disclosure": edge.disclosure,
-                }
-            )
-            await session.delete(edge)
-
-        # Auto-deprecate active memories on this now-unreachable node.
-        active_mems = await session.execute(
-            select(Memory).where(
-                Memory.node_uuid == node_uuid,
-                Memory.deprecated == False,
-            )
-        )
-        deprecated_ids = []
-        for mem in active_mems.scalars().all():
-            if snapshot is not None:
-                snapshot.setdefault("memories", []).append(
-                    self._serialize_row(mem)
-                )
-            deprecated_ids.append(mem.id)
-
-        if deprecated_ids:
-            await session.execute(
-                update(Memory)
-                .where(Memory.id.in_(deprecated_ids))
-                .values(deprecated=True)
             )
 
-        return {
-            "edges": deleted_edges,
-            "paths": deleted_paths,
-            "deprecated_memories": deprecated_ids,
+        if collector:
+            collector.record("edges", self._serialize_row(edge))
+
+        edge_info = {
+            "edge_id": edge.id,
+            "parent_uuid": edge.parent_uuid,
+            "child_uuid": edge.child_uuid,
+            "name": edge.name,
+            "priority": edge.priority,
+            "disclosure": edge.disclosure,
         }
+        await session.delete(edge)
+        return {"edge": edge_info, "paths": deleted_paths}
 
-    async def _gc_empty_node(
-        self,
-        session: AsyncSession,
-        node_uuid: str,
+    async def _cascade_delete_node(
+        self, session: AsyncSession, node_uuid: str
     ) -> Optional[Dict[str, Any]]:
-        """GC a node that has lost all its Memory rows.
+        """Hard-delete a node, all its memories, edges, and paths.
 
-        Removes any surviving edges (incoming + outgoing), their path
-        references, and the Node row itself.  Returns None if the node
-        still has memories or is the sentinel root.
+        Returns None if the node is the sentinel root.
         """
         if node_uuid == ROOT_NODE_UUID:
-            return None
-
-        remaining = await session.execute(
-            select(func.count())
-            .select_from(Memory)
-            .where(Memory.node_uuid == node_uuid)
-        )
-        if remaining.scalar() > 0:
             return None
 
         deleted_edges: List[Dict[str, Any]] = []
@@ -1266,27 +1084,13 @@ class SQLiteClient:
             )
         )
         for edge in edges_result.scalars().all():
-            paths_result = await session.execute(
-                select(Path).where(Path.edge_id == edge.id)
-            )
-            for p in paths_result.scalars().all():
-                deleted_paths.append({
-                    "domain": p.domain,
-                    "path": p.path,
-                    "edge_id": p.edge_id,
-                })
-                await session.delete(p)
+            result = await self._cascade_delete_edge(session, edge)
+            deleted_edges.append(result["edge"])
+            deleted_paths.extend(result["paths"])
 
-            deleted_edges.append({
-                "edge_id": edge.id,
-                "parent_uuid": edge.parent_uuid,
-                "child_uuid": edge.child_uuid,
-                "name": edge.name,
-                "priority": edge.priority,
-                "disclosure": edge.disclosure,
-            })
-            await session.delete(edge)
-
+        await session.execute(
+            delete(Memory).where(Memory.node_uuid == node_uuid)
+        )
         await session.execute(delete(Node).where(Node.uuid == node_uuid))
 
         return {
@@ -1294,6 +1098,394 @@ class SQLiteClient:
             "deleted_edges": deleted_edges,
             "deleted_paths": deleted_paths,
         }
+
+    async def _create_edge_with_paths(
+        self,
+        session: AsyncSession,
+        parent_uuid: str,
+        child_uuid: str,
+        name: str,
+        domain: str,
+        path: str,
+        priority: int = 0,
+        disclosure: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create (or get) an edge, its path entry, and cascade sub-paths."""
+        edge, edge_created = await self._get_or_create_edge(
+            session, parent_uuid, child_uuid, name, priority, disclosure
+        )
+        await self._insert_path(session, domain, path, edge.id)
+        await self._cascade_create_paths(session, child_uuid, domain, path)
+        return {
+            "edge": edge,
+            "edge_id": edge.id,
+            "edge_created": edge_created,
+        }
+
+    # =========================================================================
+    # Layer 3: GC / Conditional Logic
+    # Check conditions, then delegate to Layer 2/1/0.
+    # =========================================================================
+
+    async def _gc_edge_if_pathless(
+        self,
+        session: AsyncSession,
+        edge: Edge,
+        *,
+        collector: Optional[ChangeCollector] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Delete an edge only if it has no remaining path references."""
+        if await self._count_paths_for_edge(session, edge.id) > 0:
+            return None
+        if collector:
+            collector.record("edges", self._serialize_row(edge))
+        info = {
+            "edge_id": edge.id,
+            "parent_uuid": edge.parent_uuid,
+            "child_uuid": edge.child_uuid,
+            "name": edge.name,
+            "priority": edge.priority,
+            "disclosure": edge.disclosure,
+        }
+        await session.delete(edge)
+        return info
+
+    async def _gc_node_soft(
+        self,
+        session: AsyncSession,
+        node_uuid: str,
+        *,
+        collector: Optional[ChangeCollector] = None,
+    ) -> Dict[str, Any]:
+        """Soft GC: if a node has no incoming paths, deprecate its memories
+        and cascade-delete all edges/paths around it.
+
+        Memories are kept (marked deprecated) so they can be recovered.
+
+        Returns {"edges": [...], "paths": [...], "deprecated_memories": [...]}.
+        """
+        if await self._count_incoming_paths(session, node_uuid) > 0:
+            return {"edges": [], "paths": [], "deprecated_memories": []}
+
+        deleted_edges: List[Dict[str, Any]] = []
+        deleted_paths: List[Dict[str, Any]] = []
+
+        # Incoming edges are pathless by definition; delete them.
+        incoming = await session.execute(
+            select(Edge).where(Edge.child_uuid == node_uuid)
+        )
+        for edge in incoming.scalars().all():
+            info = await self._gc_edge_if_pathless(
+                session, edge, collector=collector
+            )
+            if info:
+                deleted_edges.append(info)
+
+        # Outgoing edges: delete with paths, enriching path info with
+        # the child node's active memory for the caller's return value.
+        outgoing = await session.execute(
+            select(Edge).where(Edge.parent_uuid == node_uuid)
+        )
+        for edge in outgoing.scalars().all():
+            mem_result = await session.execute(
+                select(Memory)
+                .where(
+                    Memory.node_uuid == edge.child_uuid,
+                    Memory.deprecated == False,
+                )
+            )
+            memory = mem_result.scalar_one_or_none()
+            mem_id = memory.id if memory else None
+            if memory and collector:
+                collector.record("memories", self._serialize_row(memory))
+
+            cascade_result = await self._cascade_delete_edge(
+                session, edge, collector=collector
+            )
+            for p in cascade_result["paths"]:
+                deleted_paths.append({
+                    "domain": p["domain"],
+                    "path": p["path"],
+                    "edge_id": p["edge_id"],
+                    "uri": f"{p['domain']}://{p['path']}",
+                    "node_uuid": edge.child_uuid,
+                    "memory_id": mem_id,
+                    "priority": edge.priority,
+                    "disclosure": edge.disclosure,
+                })
+            deleted_edges.append(cascade_result["edge"])
+
+        # Record pre-deprecation state, then deprecate.
+        if collector:
+            active_mems = await session.execute(
+                select(Memory).where(
+                    Memory.node_uuid == node_uuid,
+                    Memory.deprecated == False,
+                )
+            )
+            for mem in active_mems.scalars().all():
+                collector.record("memories", self._serialize_row(mem))
+
+        deprecated = await self._deprecate_node_memories(session, node_uuid)
+
+        return {
+            "edges": deleted_edges,
+            "paths": deleted_paths,
+            "deprecated_memories": deprecated,
+        }
+
+    async def _gc_node_if_memoryless(
+        self, session: AsyncSession, node_uuid: str
+    ) -> Optional[Dict[str, Any]]:
+        """Hard GC: if a node has zero memory rows, cascade-delete everything."""
+        if await self._count_memories_for_node(session, node_uuid) > 0:
+            return None
+        return await self._cascade_delete_node(session, node_uuid)
+
+    # =========================================================================
+    # Public Write API
+    # =========================================================================
+
+    async def create_memory(
+        self,
+        parent_path: str,
+        content: str,
+        priority: int,
+        title: Optional[str] = None,
+        disclosure: Optional[str] = None,
+        domain: str = "core",
+    ) -> Dict[str, Any]:
+        """
+        Create a new memory under a parent path.
+
+        Creates: Node -> Memory -> Edge (parent->child) -> Path.
+        """
+        async with self.session() as session:
+            if not parent_path:
+                parent_uuid = ROOT_NODE_UUID
+            else:
+                parent = await self._resolve_path(
+                    session, parent_path, domain
+                )
+                if not parent:
+                    raise ValueError(
+                        f"Parent '{domain}://{parent_path}' does not exist. "
+                        f"Create the parent first, or use '{domain}://' as root."
+                    )
+                _, _, parent_uuid = parent
+
+            if title:
+                final_path = f"{parent_path}/{title}" if parent_path else title
+            else:
+                next_num = await self._get_next_child_number(session, parent_uuid)
+                final_path = (
+                    f"{parent_path}/{next_num}" if parent_path else str(next_num)
+                )
+
+            existing = await session.execute(
+                select(Path).where(Path.domain == domain, Path.path == final_path)
+            )
+            if existing.scalar_one_or_none():
+                raise ValueError(f"Path '{domain}://{final_path}' already exists")
+
+            new_uuid = str(uuid_lib.uuid4())
+            await self._ensure_node(session, new_uuid)
+            memory = await self._insert_memory(session, new_uuid, content)
+
+            edge_name = title if title else final_path.rsplit("/", 1)[-1]
+            await self._create_edge_with_paths(
+                session, parent_uuid, new_uuid, edge_name,
+                domain, final_path, priority, disclosure,
+            )
+
+            return {
+                "id": memory.id,
+                "node_uuid": new_uuid,
+                "domain": domain,
+                "path": final_path,
+                "uri": f"{domain}://{final_path}",
+                "priority": priority,
+            }
+
+    async def update_memory(
+        self,
+        path: str,
+        content: Optional[str] = None,
+        priority: Optional[int] = None,
+        disclosure: Optional[str] = None,
+        domain: str = "core",
+    ) -> Dict[str, Any]:
+        """
+        Update a memory.
+
+        Content change -> new Memory row with the same node_uuid.
+        Metadata change -> update the Edge directly.
+        """
+        if content is None and priority is None and disclosure is None:
+            raise ValueError(
+                f"No update fields provided for '{domain}://{path}'. "
+                "At least one of content, priority, or disclosure must be set."
+            )
+
+        async with self.session() as session:
+            result = await session.execute(
+                select(Memory, Edge, Path)
+                .select_from(Path)
+                .join(Edge, Path.edge_id == Edge.id)
+                .join(
+                    Memory,
+                    and_(
+                        Memory.node_uuid == Edge.child_uuid,
+                        Memory.deprecated == False,
+                    ),
+                )
+                .where(Path.domain == domain, Path.path == path)
+                .order_by(Memory.created_at.desc())
+                .limit(1)
+            )
+            row = result.first()
+
+            if not row:
+                raise ValueError(
+                    f"Path '{domain}://{path}' not found or memory is deprecated"
+                )
+
+            old_memory, edge, path_obj = row
+            old_id = old_memory.id
+            node_uuid = edge.child_uuid
+
+            if priority is not None:
+                edge.priority = priority
+                session.add(edge)
+            if disclosure is not None:
+                edge.disclosure = disclosure
+                session.add(edge)
+
+            new_memory_id = old_id
+
+            if content is not None:
+                # Keep the new row deprecated until old active versions are
+                # retired, so DB-level unique-active constraints can be used.
+                new_memory = await self._insert_memory(
+                    session, node_uuid, content, deprecated=True
+                )
+                new_memory_id = new_memory.id
+                await self._deprecate_node_memories(
+                    session, node_uuid,
+                    successor_id=new_memory_id,
+                )
+                await session.execute(
+                    update(Memory)
+                    .where(Memory.id == new_memory_id)
+                    .values(deprecated=False, migrated_to=None)
+                )
+
+            if content is None:
+                session.add(path_obj)
+
+            return {
+                "domain": domain,
+                "path": path,
+                "uri": f"{domain}://{path}",
+                "old_memory_id": old_id,
+                "new_memory_id": new_memory_id,
+                "node_uuid": node_uuid,
+            }
+
+    async def rollback_to_memory(self, target_memory_id: int) -> Dict[str, Any]:
+        """Inverse of _deprecate_node_memories: restore a deprecated memory
+        as the active version, deprecating whatever is currently active."""
+        async with self.session() as session:
+            target_row = await session.execute(
+                select(Memory).where(Memory.id == target_memory_id)
+            )
+            target_memory = target_row.scalar_one_or_none()
+            if not target_memory:
+                raise ValueError(f"Memory ID {target_memory_id} not found")
+
+            if not target_memory.deprecated:
+                return {"restored_memory_id": target_memory_id, "was_already_active": True}
+
+            await self._deprecate_node_memories(
+                session, target_memory.node_uuid,
+                successor_id=target_memory_id,
+            )
+
+            await session.execute(
+                update(Memory)
+                .where(Memory.id == target_memory_id)
+                .values(deprecated=False, migrated_to=None)
+            )
+
+            return {"restored_memory_id": target_memory_id, "node_uuid": target_memory.node_uuid}
+
+    async def add_path(
+        self,
+        new_path: str,
+        target_path: str,
+        new_domain: str = "core",
+        target_domain: str = "core",
+        priority: int = 0,
+        disclosure: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create an alias path pointing to the same node as target_path.
+
+        Also cascades: automatically creates sub-paths for all descendants.
+        """
+        async with self.session() as session:
+            target = await self._resolve_path(
+                session, target_path, target_domain
+            )
+            if not target:
+                raise ValueError(
+                    f"Target path '{target_domain}://{target_path}' not found"
+                )
+            _, _, target_node_uuid = target
+
+            if "/" in new_path:
+                parent_path = new_path.rsplit("/", 1)[0]
+                parent = await self._resolve_path(
+                    session, parent_path, new_domain
+                )
+                if not parent:
+                    raise ValueError(
+                        f"Parent '{new_domain}://{parent_path}' does not exist. "
+                        f"Create the parent first, or use a shallower alias path."
+                    )
+                _, _, parent_uuid = parent
+            else:
+                parent_uuid = ROOT_NODE_UUID
+
+            existing = await session.execute(
+                select(Path)
+                .where(Path.domain == new_domain, Path.path == new_path)
+            )
+            if existing.scalar_one_or_none():
+                raise ValueError(f"Path '{new_domain}://{new_path}' already exists")
+
+            if await self._would_create_cycle(
+                session, parent_uuid, target_node_uuid
+            ):
+                raise ValueError(
+                    f"Cannot create alias '{new_domain}://{new_path}': "
+                    f"target node is an ancestor of the destination parent, "
+                    f"which would create a cycle in the graph."
+                )
+
+            result = await self._create_edge_with_paths(
+                session, parent_uuid, target_node_uuid,
+                new_path.rsplit("/", 1)[-1], new_domain, new_path,
+                priority, disclosure,
+            )
+
+            return {
+                "new_uri": f"{new_domain}://{new_path}",
+                "target_uri": f"{target_domain}://{target_path}",
+                "node_uuid": target_node_uuid,
+                "edge_id": result["edge_id"],
+                "edge_created": result["edge_created"],
+            }
 
     async def remove_path(
         self, path: str, domain: str = "core"
@@ -1307,7 +1499,7 @@ class SQLiteClient:
 
         If the target node loses its last reachable path, pathless incoming/
         outgoing edges around the target node are pruned so dead graph
-        fragments do not linger. The target node's memory is preserved but
+        fragments do not linger.  The target node's memory is preserved but
         becomes an orphan (recoverable via the review interface).
 
         Raises:
@@ -1315,28 +1507,12 @@ class SQLiteClient:
                 create unreachable child nodes.
         """
         async with self.session() as session:
-            # 1. Find target path + edge
-            result = await session.execute(
-                select(Path, Edge)
-                .join(Edge, Path.edge_id == Edge.id)
-                .where(Path.domain == domain)
-                .where(Path.path == path)
-            )
-            row = result.first()
-            if not row:
+            target = await self._resolve_path(session, path, domain)
+            if not target:
                 raise ValueError(f"Path '{domain}://{path}' not found")
+            _, target_edge, target_node_uuid = target
 
-            _, target_edge = row
-            target_node_uuid = target_edge.child_uuid
-
-            safe_path = (
-                path.replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-            )
-
-            # 2. Pre-flight orphan check: every direct child must have
-            #    at least one path that would survive this deletion.
+            # Pre-flight orphan check
             child_edges_result = await session.execute(
                 select(Edge).where(Edge.parent_uuid == target_node_uuid)
             )
@@ -1344,26 +1520,18 @@ class SQLiteClient:
 
             would_orphan = []
             for child_edge in child_edges:
-                surviving = await session.execute(
-                    select(func.count())
-                    .select_from(Path)
-                    .join(Edge, Path.edge_id == Edge.id)
-                    .where(Edge.child_uuid == child_edge.child_uuid)
-                    .where(
-                        not_(
-                            and_(
-                                Path.domain == domain,
-                                Path.path.like(f"{safe_path}/%", escape="\\"),
-                            )
-                        )
-                    )
+                surviving_count = await self._count_incoming_paths(
+                    session,
+                    child_edge.child_uuid,
+                    exclude_domain=domain,
+                    exclude_path_prefix=path,
                 )
-                if surviving.scalar() == 0:
+                if surviving_count == 0:
                     would_orphan.append(child_edge)
 
             if would_orphan:
                 details = ", ".join(
-                    f"'{e.name}' (node: {e.child_uuid[:8]}…)"
+                    f"'{e.name}' (node: {e.child_uuid[:8]}...)"
                     for e in would_orphan
                 )
                 raise ValueError(
@@ -1374,75 +1542,76 @@ class SQLiteClient:
                     f"or remove them explicitly."
                 )
 
-            # 3. Collect subtree paths (target + descendants by prefix)
-            subtree_result = await session.execute(
-                select(Path, Edge, Memory)
-                .join(Edge, Path.edge_id == Edge.id)
-                .outerjoin(
-                    Memory,
-                    and_(
-                        Memory.node_uuid == Edge.child_uuid,
-                        Memory.deprecated == False,
-                    ),
+            # Delete subtree paths
+            collector = ChangeCollector()
+            deleted_path_dicts = await self._delete_subtree_paths(
+                session, domain, path, collector=collector
+            )
+
+            # Enrich with Edge/Memory info for return value
+            edge_ids = {
+                d["edge_id"] for d in deleted_path_dicts if d.get("edge_id")
+            }
+            edges_map: Dict[int, Edge] = {}
+            if edge_ids:
+                edges_result = await session.execute(
+                    select(Edge).where(Edge.id.in_(edge_ids))
                 )
-                .where(Path.domain == domain)
-                .where(
-                    or_(
-                        Path.path == path,
-                        Path.path.like(f"{safe_path}/%", escape="\\"),
+                edges_map = {
+                    e.id: e for e in edges_result.scalars().all()
+                }
+
+            node_uuids = {e.child_uuid for e in edges_map.values()}
+            memories_map: Dict[str, Memory] = {}
+            if node_uuids:
+                memories_result = await session.execute(
+                    select(Memory).where(
+                        Memory.node_uuid.in_(node_uuids),
+                        Memory.deprecated == False,
                     )
                 )
-            )
-            subtree_rows = subtree_result.all()
+                memories_map = {
+                    m.node_uuid: m for m in memories_result.scalars().all()
+                }
 
-            # 4. Snapshot info before deletion
             deleted_paths_info = []
-            snapshot: Dict[str, list] = {"edges": [], "paths": [], "memories": []}
             seen_edges: set = set()
             seen_memories: set = set()
 
-            for p, e, memory in subtree_rows:
-                deleted_paths_info.append(
-                    {
-                        "domain": p.domain,
-                        "path": p.path,
-                        "edge_id": p.edge_id,
-                        "uri": f"{p.domain}://{p.path}",
-                        "node_uuid": e.child_uuid,
-                        "memory_id": memory.id if memory else None,
-                        "priority": e.priority,
-                        "disclosure": e.disclosure,
-                    }
-                )
-                snapshot["paths"].append(self._serialize_row(p))
-                if e.id not in seen_edges:
+            for d in deleted_path_dicts:
+                e = edges_map.get(d.get("edge_id"))
+                memory = memories_map.get(e.child_uuid) if e else None
+
+                deleted_paths_info.append({
+                    "domain": d["domain"],
+                    "path": d["path"],
+                    "edge_id": d.get("edge_id"),
+                    "uri": f"{d['domain']}://{d['path']}",
+                    "node_uuid": e.child_uuid if e else None,
+                    "memory_id": memory.id if memory else None,
+                    "priority": e.priority if e else None,
+                    "disclosure": e.disclosure if e else None,
+                })
+                if e and e.id not in seen_edges:
                     seen_edges.add(e.id)
-                    snapshot["edges"].append(self._serialize_row(e))
+                    collector.record("edges", self._serialize_row(e))
                 if memory and memory.id not in seen_memories:
                     seen_memories.add(memory.id)
-                    snapshot["memories"].append(self._serialize_row(memory))
+                    collector.record("memories", self._serialize_row(memory))
 
-            # 5. Delete all sub-paths
-            for p, _, _ in subtree_rows:
-                await session.delete(p)
             await session.flush()
 
-            # 6. Edge cleanup
-            #    - Drop the entry edge if it lost all its path references.
-            #    - If target node is now completely unreachable, GC all
-            #      dangling edges and their orphaned path references.
-            #    The snapshot accumulator captures serialized rows
-            #    before each deletion for changeset recording.
+            # GC: edge + node cleanup
             deleted_edges = []
 
-            info = await self._delete_edge_if_pathless(
-                session, target_edge, snapshot=snapshot
+            info = await self._gc_edge_if_pathless(
+                session, target_edge, collector=collector
             )
             if info:
                 deleted_edges.append(info)
 
-            gc_result = await self._gc_unreachable_node_edges(
-                session, target_node_uuid, snapshot=snapshot
+            gc_result = await self._gc_node_soft(
+                session, target_node_uuid, collector=collector
             )
             deleted_edges.extend(gc_result["edges"])
             deleted_paths_info.extend(gc_result["paths"])
@@ -1452,7 +1621,7 @@ class SQLiteClient:
                 "node_uuid": target_node_uuid,
                 "deleted_paths": deleted_paths_info,
                 "deleted_edges": deleted_edges,
-                "snapshot_before": snapshot,
+                "snapshot_before": collector.to_dict(),
             }
 
     async def undo_remove_path(
@@ -1532,51 +1701,30 @@ class SQLiteClient:
                     .values(deprecated=False, migrated_to=None)
                 )
 
-            # Check collision
             existing = await session.execute(
-                select(Path).where(Path.domain == domain).where(Path.path == path)
+                select(Path).where(Path.domain == domain, Path.path == path)
             )
             if existing.scalar_one_or_none():
                 raise ValueError(f"Path '{domain}://{path}' already exists")
 
-            # Determine parent
             if parent_uuid is None:
                 if "/" in path:
                     parent_path_str = path.rsplit("/", 1)[0]
-                    parent_result = await session.execute(
-                        select(Edge.child_uuid)
-                        .select_from(Path)
-                        .join(Edge, Path.edge_id == Edge.id)
-                        .where(Path.domain == domain)
-                        .where(Path.path == parent_path_str)
+                    parent = await self._resolve_path(
+                        session, parent_path_str, domain
                     )
-                    parent_row = parent_result.first()
-                    parent_uuid = parent_row[0] if parent_row else ROOT_NODE_UUID
+                    if parent:
+                        _, _, parent_uuid = parent
+                    else:
+                        parent_uuid = ROOT_NODE_UUID
                 else:
                     parent_uuid = ROOT_NODE_UUID
 
-            # Get or create edge
             edge_name = path.rsplit("/", 1)[-1]
-            edge_result = await session.execute(
-                select(Edge).where(
-                    Edge.parent_uuid == parent_uuid,
-                    Edge.child_uuid == node_uuid,
-                )
+            edge, _ = await self._get_or_create_edge(
+                session, parent_uuid, node_uuid, edge_name, priority, disclosure
             )
-            edge = edge_result.scalar_one_or_none()
-
-            if not edge:
-                edge = Edge(
-                    parent_uuid=parent_uuid,
-                    child_uuid=node_uuid,
-                    name=edge_name,
-                    priority=priority,
-                    disclosure=disclosure,
-                )
-                session.add(edge)
-                await session.flush()
-
-            session.add(Path(domain=domain, path=path, edge_id=edge.id))
+            await self._insert_path(session, domain, path, edge.id)
 
             return {"uri": f"{domain}://{path}", "node_uuid": node_uuid}
 
@@ -1890,81 +2038,30 @@ class SQLiteClient:
             return detail
 
     async def permanently_delete_memory(
-        self, memory_id: int, *, require_orphan: bool = False
+        self, memory_id: int
     ) -> Dict[str, Any]:
         """
         Permanently delete a memory version (human only).
 
-        Repairs the version chain by skipping over the deleted node.
-        If this was the last memory for the node, GCs the node row
-        and any surviving edges/paths (bug-resilient cleanup).
+        Repairs the version chain, deletes the row.  If this was the
+        last memory for the node, hard-GCs the node.
+        Refuses to delete an active memory.
         """
         async with self.session() as session:
-            target_result = await session.execute(
-                select(Memory).where(Memory.id == memory_id)
+            delete_result = await self._safely_delete_memory(
+                session,
+                memory_id,
+                require_deprecated=True,
             )
-            target = target_result.scalar_one_or_none()
-            if not target:
-                raise ValueError(f"Memory ID {memory_id} not found")
-
-            if require_orphan and not target.deprecated:
-                raise PermissionError(
-                    f"Memory {memory_id} is not an orphan "
-                    f"(deprecated=False). Deletion aborted."
-                )
-
-            was_active = not target.deprecated
-            node_uuid = target.node_uuid
-            successor_id = target.migrated_to
-
-            # Repair chain: predecessors skip over deleted node
-            await session.execute(
-                update(Memory)
-                .where(Memory.migrated_to == memory_id)
-                .values(migrated_to=successor_id)
-            )
-
-            # Delete the memory row
-            result = await session.execute(delete(Memory).where(Memory.id == memory_id))
-
-            if result.rowcount == 0:
-                raise ValueError(f"Memory ID {memory_id} not found")
 
             response: Dict[str, Any] = {
-                "deleted_memory_id": memory_id,
-                "chain_repaired_to": successor_id,
+                "deleted_memory_id": delete_result["deleted_memory_id"],
+                "chain_repaired_to": delete_result["chain_repaired_to"],
             }
 
+            node_uuid = delete_result["node_uuid"]
             if node_uuid:
-                if was_active:
-                    active_count_result = await session.execute(
-                        select(func.count())
-                        .select_from(Memory)
-                        .where(
-                            Memory.node_uuid == node_uuid,
-                            Memory.deprecated == False,
-                        )
-                    )
-                    if active_count_result.scalar() == 0:
-                        fallback_result = await session.execute(
-                            select(Memory.id)
-                            .where(
-                                Memory.node_uuid == node_uuid,
-                                Memory.deprecated == True,
-                            )
-                            .order_by(Memory.created_at.desc(), Memory.id.desc())
-                            .limit(1)
-                        )
-                        fallback_id = fallback_result.scalar_one_or_none()
-                        if fallback_id is not None:
-                            await session.execute(
-                                update(Memory)
-                                .where(Memory.id == fallback_id)
-                                .values(deprecated=False, migrated_to=None)
-                            )
-                            response["fallback_restored_memory_id"] = fallback_id
-
-                gc_result = await self._gc_empty_node(session, node_uuid)
+                gc_result = await self._gc_node_if_memoryless(session, node_uuid)
                 if gc_result:
                     response["node_gc"] = gc_result
 
