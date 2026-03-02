@@ -601,8 +601,11 @@ async def update_memory(
         old_string: [Patch mode] Text to find in existing content (must be unique)
         new_string: [Patch mode] Text to replace old_string with. Use "" to delete a section.
         append: [Append mode] Text to append to the end of existing content
-        priority: New priority (None = keep existing)
-        disclosure: New disclosure instruction (None = keep existing)
+        priority: New priority **for this specific URI/edge** (None = keep existing).
+                  Priority is bound to the path (edge), NOT the memory content.
+                  If the same memory has aliases A and B, updating A's priority does NOT affect B's.
+        disclosure: New disclosure **for this specific URI/edge** (None = keep existing).
+                    Same edge-binding rule as priority.
 
     Returns:
         Success message with URI
