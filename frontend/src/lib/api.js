@@ -59,4 +59,19 @@ export const getDomains = () =>
 export const getNamespaces = () =>
   api.get('/browse/namespaces').then(res => res.data);
 
+export const getHealth = () =>
+  api.get('/health').then(res => res.data);
+
+export const getRecentMemories = (limit = 8) =>
+  api.get('/browse/recent', { params: { limit } }).then(res => res.data);
+
+export const searchMemories = (query, limit = 8) =>
+  api.get('/browse/search', { params: { q: query, limit } }).then(res => res.data);
+
+export const quickCreateMemory = (payload) =>
+  api.post('/browse/memories', payload).then(res => res.data);
+
+export const getMaintenanceOrphans = () =>
+  api.get('/maintenance/orphans').then(res => res.data);
+
 export default api;

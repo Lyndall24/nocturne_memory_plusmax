@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { BrowserRouter, Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom';
-import { ShieldCheck, Database, LayoutGrid, Sparkles, AlertCircle, Layers } from 'lucide-react';
+import { ShieldCheck, Database, LayoutGrid, Sparkles, AlertCircle, Layers, Activity } from 'lucide-react';
 import clsx from 'clsx';
 
+import DashboardPage from './features/dashboard/DashboardPage';
 import ReviewPage from './features/review/ReviewPage';
 import MemoryBrowser from './features/memory/MemoryBrowser';
 import MaintenancePage from './features/maintenance/MaintenancePage';
@@ -114,6 +115,17 @@ function Layout() {
 
         <nav className="flex items-center gap-1 h-full">
           <NavLink
+            to="/dashboard"
+            className={({ isActive }) => clsx(
+              "h-full flex items-center gap-2 px-4 text-sm font-medium border-b-2 transition-colors",
+              isActive ? "border-cyan-500 text-cyan-400 bg-slate-800/50" : "border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/30"
+            )}
+          >
+            <Activity size={16} />
+            Dashboard
+          </NavLink>
+
+          <NavLink
             to="/review"
             className={({ isActive }) => clsx(
               "h-full flex items-center gap-2 px-4 text-sm font-medium border-b-2 transition-colors",
@@ -153,7 +165,9 @@ function Layout() {
       {/* Main Area */}
       <div className="flex-1 min-h-0 overflow-hidden">
         <Routes>
-          <Route path="/" element={<Navigate to="/review" replace />} />
+          <Route path="/" element={<Navigate to="/dashboard" replace />} />
+
+          <Route path="/dashboard" element={<DashboardPage />} />
 
           <Route path="/review" element={<ReviewPage />} />
 

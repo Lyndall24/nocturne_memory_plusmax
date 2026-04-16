@@ -7,7 +7,12 @@ hierarchical browser. Every path is just a node with content and children.
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
-from db import get_graph_service, get_glossary_service, get_db_manager
+from db import (
+    get_graph_service,
+    get_glossary_service,
+    get_db_manager,
+    get_search_indexer,
+)
 from db.models import Path as PathModel, Edge as EdgeModel, ROOT_NODE_UUID
 from db.namespace import get_namespace
 from sqlalchemy import select, distinct
@@ -29,6 +34,21 @@ class GlossaryAdd(BaseModel):
 class GlossaryRemove(BaseModel):
     keyword: str
     node_uuid: str
+
+
+class QuickCreateRequest(BaseModel):
+    parent_uri: str
+    content: str
+    priority: int = 2
+    title: str | None = None
+    disclosure: str | None = None
+
+
+def _parse_uri(uri: str) -> tuple[str, str]:
+    if "://" not in uri:
+        raise ValueError("URI must include a domain, e.g. core://parent/path")
+    domain, path = uri.split("://", 1)
+    return (domain or "core"), path
 
 
 @router.get("/namespaces")
@@ -69,6 +89,41 @@ async def list_domains():
             {"domain": row.domain, "root_count": row.node_count}
             for row in result.all()
         ]
+
+
+@router.get("/recent")
+async def get_recent(limit: int = Query(8, ge=1, le=50)):
+    graph = get_graph_service()
+    return await graph.get_recent_memories(limit=limit, namespace=get_namespace())
+
+
+@router.get("/search")
+async def search_memories(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(8, ge=1, le=25),
+):
+    search = get_search_indexer()
+    return await search.search(q, limit=limit, namespace=get_namespace())
+
+
+@router.post("/memories")
+async def quick_create_memory(body: QuickCreateRequest):
+    graph = get_graph_service()
+
+    try:
+        domain, parent_path = _parse_uri(body.parent_uri.strip())
+        title = body.title.strip() if body.title else None
+        return await graph.create_memory(
+            parent_path=parent_path,
+            domain=domain,
+            title=title,
+            content=body.content,
+            priority=body.priority,
+            disclosure=body.disclosure,
+            namespace=get_namespace(),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 @router.get("/node")

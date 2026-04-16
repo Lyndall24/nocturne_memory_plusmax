@@ -51,6 +51,63 @@ async def test_browse_node_round_trip_update(api_client, graph_service):
     assert payload["disclosure"] == "When updating workspace"
 
 
+async def test_browse_recent_returns_latest_memories(api_client, graph_service):
+    await graph_service.create_memory(
+        parent_path="",
+        content="First memory",
+        priority=3,
+        title="first",
+        disclosure="First disclosure",
+    )
+    await graph_service.create_memory(
+        parent_path="",
+        content="Second memory",
+        priority=1,
+        title="second",
+        disclosure="Second disclosure",
+    )
+
+    response = await api_client.get("/browse/recent", params={"limit": 5})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["uri"] for item in payload][:2] == ["core://second", "core://first"]
+
+
+async def test_browse_search_returns_ranked_matches(api_client, graph_service):
+    await graph_service.create_memory(
+        parent_path="",
+        content="Observability notes for dashboard work",
+        priority=2,
+        title="ops_notes",
+        disclosure="Operator notes",
+    )
+
+    response = await api_client.get("/browse/search", params={"q": "dashboard"})
+
+    assert response.status_code == 200
+    assert response.json()[0]["uri"] == "core://ops_notes"
+
+
+async def test_browse_quick_create_creates_and_returns_memory_uri(api_client):
+    response = await api_client.post(
+        "/browse/memories",
+        json={
+            "parent_uri": "core://",
+            "title": "dashboard_seed",
+            "content": "Created from dashboard quick action",
+            "priority": 2,
+            "disclosure": "Operator-created",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["uri"] == "core://dashboard_seed"
+    assert payload["domain"] == "core"
+    assert payload["path"] == "dashboard_seed"
+
+
 async def test_review_group_diff_and_rollback(api_client, graph_service, mcp_module):
     await _seed_review_change(graph_service, mcp_module)
 
