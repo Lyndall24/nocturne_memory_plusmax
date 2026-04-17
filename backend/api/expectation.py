@@ -5,11 +5,11 @@ Stores user preferences for how memories should be loaded and expressed.
 intensity / dependency / expression each range 0-2.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from db import get_db_manager
@@ -30,6 +30,8 @@ class ExpectationPayload(BaseModel):
 
 
 class ExpectationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     session_id: str
     intensity: int
     dependency: int
@@ -56,14 +58,7 @@ async def _get_or_default(session, session_id: str) -> ExpectationResponse:
             note=None,
             updated_at=None,
         )
-    return ExpectationResponse(
-        session_id=row.session_id,
-        intensity=row.intensity,
-        dependency=row.dependency,
-        expression=row.expression,
-        note=row.note,
-        updated_at=row.updated_at,
-    )
+    return ExpectationResponse.model_validate(row)
 
 
 # ---------------------------------------------------------------------------
@@ -94,21 +89,14 @@ async def upsert_expectation(session_id: str, payload: ExpectationPayload):
         row.dependency = payload.dependency
         row.expression = payload.expression
         row.note = payload.note
-        row.updated_at = datetime.utcnow()
+        row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         await s.flush()
-        return ExpectationResponse(
-            session_id=row.session_id,
-            intensity=row.intensity,
-            dependency=row.dependency,
-            expression=row.expression,
-            note=row.note,
-            updated_at=row.updated_at,
-        )
+        return ExpectationResponse.model_validate(row)
 
 
 @router.delete("/{session_id}")
 async def delete_expectation(session_id: str):
-    """Remove stored expectation (session will revert to defaults)."""
+    """Remove stored expectation (idempotent — returns success even if not found)."""
     db = get_db_manager()
     async with db.session() as s:
         result = await s.execute(
