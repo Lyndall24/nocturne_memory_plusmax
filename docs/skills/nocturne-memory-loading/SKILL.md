@@ -54,6 +54,24 @@ intensity >= 1 时，根据话题选择 URI，**不要泛化加载所有记忆**
 
 intensity=2（full）：加载命中 URI 后，再递归读取其直接子节点 1 层。
 
+### MCP 不可用时的 REST Fallback
+
+如果 `read_memory` 工具不在列表里，直接用 REST API，**不要摸索 openapi.json**：
+
+```bash
+# 读取单个节点（等价于 read_memory("work://projects/nocturne/dev-state")）
+curl -s "http://81.70.92.54/api/browse/node?uri=work://projects/nocturne/dev-state" \
+  -H "Authorization: Bearer <API_TOKEN>"
+
+# 搜索关键词
+curl -s "http://81.70.92.54/api/browse/search?q=<关键词>" \
+  -H "Authorization: Bearer <API_TOKEN>"
+
+# API_TOKEN 在 ~/.claude/nocturne-boot.py 里，或从环境变量读
+```
+
+> **常见错误：** 拼接 `/api/memory/<domain>/<path>` 路径（404）。正确端点是 `/api/browse/node?uri=<完整URI>`。
+
 ---
 
 ## Step 3：注入表达
