@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from api import review_router, browse_router, maintenance_router
+from api import review_router, browse_router, maintenance_router, expectation_router
 from auth import BearerTokenAuthMiddleware
 from namespace_middleware import NamespaceMiddleware
 from db import get_db_manager, close_db
@@ -57,6 +57,7 @@ app.include_router(health_router)
 app.include_router(review_router)
 app.include_router(browse_router)
 app.include_router(maintenance_router)
+app.include_router(expectation_router)
 
 
 @app.get("/")
