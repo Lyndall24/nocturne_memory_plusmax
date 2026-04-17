@@ -214,6 +214,25 @@ class SearchDocument(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+class Expectation(Base):
+    """Session-level user preferences for memory loading behavior.
+
+    Controls three axes of memory injection:
+    - intensity: how much historical memory to load (0=none, 1=normal, 2=full)
+    - dependency: how strongly the reply should depend on memory context (0=weak, 1=normal, 2=strong)
+    - expression: whether to explicitly cite loaded memories (0=silent, 1=reference, 2=explicit)
+    """
+
+    __tablename__ = "expectations"
+
+    session_id = Column(String(128), primary_key=True)
+    intensity = Column(Integer, default=1)   # 0=none  1=normal  2=full
+    dependency = Column(Integer, default=1)  # 0=weak  1=normal  2=strong
+    expression = Column(Integer, default=1)  # 0=silent 1=reference 2=explicit
+    note = Column(Text, nullable=True)       # 用户原话/推断依据，可选
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 # =============================================================================
 # Change Collector
 # =============================================================================
