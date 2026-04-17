@@ -30,14 +30,24 @@ The skill must fill three specific gaps:
 
 ## GREEN Phase (with skill deployed)
 
-Date: [fill in]
-Skill version: [fill in]
+Date: 2026-04-17
+Skill version: nocturne-memory-loading (commit 97e8c69, patched to 142e99e)
 
 ### Scenario 1 result
-[PASS / FAIL + actual behavior]
+**Input:** "我们继续做 Nocturne Memory 的前端优化"
+**Observed:**
+- `Skill(nocturne-memory-loading)` loaded ✅
+- `POST /api/expectation/{session_id}` called with `intensity: 2` ✅
+- Claude attempted `read_memory("work://projects/nocturne/dev-state")` via MCP
+- MCP not in tool list → Claude fell back to REST API (`/api/browse/node?uri=...`) ✅
+- Response correctly referenced current project state
+**Result: PASS** — Expectation persisted, domain routing correct, REST fallback worked
 
 ### Scenario 3 result
-[PASS / FAIL + actual behavior]
+**Not tested in GREEN phase.** Key assumption: intensity=0 suppresses all read_memory calls.
+To verify: input "不用管之前的，帮我写一个 Python 函数" and confirm no tool calls to memory API.
 
 ### Overall verdict
-[Did the skill achieve expected behavior? Any remaining loopholes?]
+Skill achieves core goals: Expectation POST called correctly, domain routing works, REST fallback
+added as patch (commit 142e99e). Remaining gap: `dependency` axis behavior not specified in skill
+rules — Claude POSTs the value but has no guidance on what to DO differently for dependency=2 vs 0.
