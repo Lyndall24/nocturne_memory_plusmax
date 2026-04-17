@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Tag, X, Save, Plus } from 'lucide-react';
 import { api } from '../../../lib/api';
+import { useToast } from '../../../components/Toast';
 
 const KeywordManager = ({ keywords, nodeUuid, onUpdate }) => {
+  const toast = useToast();
   const [adding, setAdding] = useState(false);
   const [newKeyword, setNewKeyword] = useState('');
   const inputRef = useRef(null);
@@ -20,7 +22,7 @@ const KeywordManager = ({ keywords, nodeUuid, onUpdate }) => {
       setAdding(false);
       onUpdate();
     } catch (err) {
-      alert('Failed to add keyword: ' + (err.response?.data?.detail || err.message));
+      toast.error('Failed to add keyword: ' + (err.response?.data?.detail || err.message));
     }
   };
 
@@ -30,7 +32,7 @@ const KeywordManager = ({ keywords, nodeUuid, onUpdate }) => {
       await api.delete('/browse/glossary', { data: { keyword: kw, node_uuid: nodeUuid } });
       onUpdate();
     } catch (err) {
-      alert('Failed to remove keyword: ' + (err.response?.data?.detail || err.message));
+      toast.error('Failed to remove keyword: ' + (err.response?.data?.detail || err.message));
     }
   };
 

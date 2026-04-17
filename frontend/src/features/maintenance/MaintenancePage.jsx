@@ -1,13 +1,22 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import {
-  Trash2, Sparkles, AlertTriangle, RefreshCw,
+  Trash2, Sparkles, RefreshCw,
   ChevronDown, ChevronUp, ArrowRight, Unlink, Archive, CheckSquare, Square, Minus
 } from 'lucide-react';
 import { format } from 'date-fns';
 import DiffViewer from '../../components/DiffViewer';
+import EmptyState from '../../components/EmptyState';
+import ErrorState from '../../components/ErrorState';
 import { api } from '../../lib/api';
+import { useToast } from '../../components/Toast';
+import { useConfirm } from '../../components/ConfirmDialog';
+import { useNamespace } from '../../context/NamespaceContext';
 
 export default function MaintenancePage() {
+  const toast = useToast();
+  const confirm = useConfirm();
+  const { namespace } = useNamespace();
+
   const [orphans, setOrphans] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -23,7 +32,11 @@ export default function MaintenancePage() {
 
   useEffect(() => {
     loadOrphans();
-  }, []);
+    // Reset detail cache when namespace changes since ids are per-namespace.
+    setDetailData({});
+    setExpandedId(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [namespace]);
 
   const loadOrphans = async () => {
     setLoading(true);
@@ -69,7 +82,13 @@ export default function MaintenancePage() {
   const handleBatchDelete = async () => {
     const count = selectedIds.size;
     if (count === 0) return;
-    if (!confirm(`Permanently delete ${count} memories? This cannot be undone.`)) return;
+    const ok = await confirm({
+      title: `Delete ${count} ${count === 1 ? 'memory' : 'memories'}?`,
+      message: 'This permanently removes the selected orphan memories. This cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
 
     setBatchDeleting(true);
     const toDelete = [...selectedIds];
@@ -92,8 +111,13 @@ export default function MaintenancePage() {
       setExpandedId(null);
     }
 
-    if (failed.length > 0) {
-      alert(`${failed.length} of ${count} deletions failed. Failed IDs: ${failed.join(', ')}`);
+    const succeeded = count - failed.length;
+    if (failed.length === 0) {
+      toast.success(`Deleted ${succeeded} ${succeeded === 1 ? 'memory' : 'memories'}`);
+    } else if (succeeded === 0) {
+      toast.error(`All ${count} deletions failed`);
+    } else {
+      toast.error(`${failed.length} of ${count} deletions failed (IDs: ${failed.join(', ')})`);
     }
 
     setBatchDeleting(false);
@@ -355,19 +379,18 @@ export default function MaintenancePage() {
               <span className="text-xs tracking-widest uppercase">Scanning for orphans...</span>
             </div>
           ) : error ? (
-            <div className="text-rose-400 bg-rose-950/20 border border-rose-800/40 p-6 rounded-lg flex items-center gap-4">
-              <AlertTriangle size={24} />
-              <div>
-                <h3 className="font-bold text-rose-300">Error</h3>
-                <p className="text-sm text-rose-400/80">{error}</p>
-              </div>
-            </div>
+            <ErrorState
+              title="Failed to scan"
+              message={error}
+              actionLabel="Retry"
+              onAction={loadOrphans}
+            />
           ) : orphans.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-slate-600 gap-6 select-none">
-              <Sparkles size={64} className="opacity-30" />
-              <p className="text-lg font-light text-slate-500">System Clean</p>
-              <p className="text-xs uppercase tracking-widest text-slate-600">No orphan memories detected</p>
-            </div>
+            <EmptyState
+              icon={Sparkles}
+              title="System Clean"
+              description="No orphan memories detected."
+            />
           ) : (
             <div className="max-w-5xl mx-auto space-y-8">
               {/* Deprecated Section */}

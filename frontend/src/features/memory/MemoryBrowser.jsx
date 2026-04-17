@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { 
-  Folder, 
-  Edit3, 
-  Save, 
-  X, 
-  Cpu, 
-  Hash, 
+import {
+  Folder,
+  Edit3,
+  Save,
+  X,
+  Cpu,
+  Hash,
   AlertTriangle,
   Link2,
   Star
@@ -19,31 +19,37 @@ import KeywordManager from './components/KeywordManager';
 import DomainNode from './components/MemorySidebar';
 import Breadcrumb from './components/Breadcrumb';
 import NodeGridCard from './components/NodeGridCard';
+import EmptyState from '../../components/EmptyState';
+import ErrorState from '../../components/ErrorState';
+import { useToast } from '../../components/Toast';
+import { useNamespace } from '../../context/NamespaceContext';
 
 export default function MemoryBrowser() {
   const [searchParams, setSearchParams] = useSearchParams();
   const domain = searchParams.get('domain') || 'core';
   const path = searchParams.get('path') || '';
-  
+  const { namespace } = useNamespace();
+  const toast = useToast();
+
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [data, setData] = useState({ node: null, children: [], breadcrumbs: [] });
   const [domains, setDomains] = useState([]);
-  
+
   const [editing, setEditing] = useState(false);
   const [editContent, setEditContent] = useState('');
   const [editDisclosure, setEditDisclosure] = useState('');
   const [editPriority, setEditPriority] = useState(0);
   const [saving, setSaving] = useState(false);
 
-  const currentRouteRef = useRef({ domain, path });
+  const currentRouteRef = useRef({ domain, path, namespace });
   useEffect(() => {
-    currentRouteRef.current = { domain, path };
-  }, [domain, path]);
+    currentRouteRef.current = { domain, path, namespace };
+  }, [domain, path, namespace]);
 
   useEffect(() => {
     api.get('/browse/domains').then(res => setDomains(res.data)).catch(() => {});
-  }, []);
+  }, [namespace]);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -63,7 +69,7 @@ export default function MemoryBrowser() {
       }
     };
     fetchData();
-  }, [domain, path]);
+  }, [domain, path, namespace]);
 
   const navigateTo = (newPath, newDomain) => {
     const params = new URLSearchParams();
@@ -76,7 +82,8 @@ export default function MemoryBrowser() {
     return api.get('/browse/node', { params: { domain, path } })
       .then(res => {
         setData(currentData => {
-          if (currentRouteRef.current.domain === domain && currentRouteRef.current.path === path) {
+          const ref = currentRouteRef.current;
+          if (ref.domain === domain && ref.path === path && ref.namespace === namespace) {
             return res.data;
           }
           return currentData;
@@ -105,21 +112,59 @@ export default function MemoryBrowser() {
       if (editContent !== (data.node?.content || '')) payload.content = editContent;
       if (editPriority !== (data.node?.priority ?? 0)) payload.priority = editPriority;
       if (editDisclosure !== (data.node?.disclosure || '')) payload.disclosure = editDisclosure;
-      
+
       if (Object.keys(payload).length === 0) {
         setEditing(false);
         return;
       }
-      
+
       await api.put('/browse/node', payload, { params: { domain, path } });
       await refreshData();
       setEditing(false);
+      toast.success('Memory saved');
     } catch (err) {
-      alert('Save failed: ' + err.message);
+      const detail = err.response?.data?.detail || err.message;
+      toast.error('Save failed: ' + detail);
     } finally {
       setSaving(false);
     }
   };
+
+  // Keyboard shortcuts:
+  //   Cmd/Ctrl + S  → save (when editing)
+  //   Escape        → cancel editing
+  //   Cmd/Ctrl + E  → enter edit mode (when viewing a real, non-virtual node)
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (editing) {
+        if (mod && e.key.toLowerCase() === 's') {
+          e.preventDefault();
+          if (!saving) handleSave();
+        } else if (e.key === 'Escape') {
+          // Don't consume Escape if a modal is open above us —
+          // ConfirmDialog listens to Escape too, and native dialogs handle it.
+          if (!document.querySelector('[role="dialog"]')) {
+            e.preventDefault();
+            cancelEditing();
+          }
+        }
+      } else {
+        if (mod && e.key.toLowerCase() === 'e') {
+          const node = data.node;
+          if (node && !node.is_virtual) {
+            e.preventDefault();
+            startEditing();
+          }
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+    // handleSave/startEditing/cancelEditing are stable-ish closures over current state;
+    // we re-register when editing/saving/data changes to pick up latest values.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editing, saving, data, editContent, editDisclosure, editPriority]);
 
   const isRoot = !path;
   const node = data.node;
@@ -187,11 +232,12 @@ export default function MemoryBrowser() {
                     <span className="text-xs tracking-widest uppercase">Retrieving Neural Data...</span>
                 </div>
             ) : error ? (
-                <div className="h-full flex flex-col items-center justify-center text-rose-500 gap-4">
-                    <p className="text-lg">Access Denied / Error</p>
-                    <p className="text-sm opacity-60">{error}</p>
-                    <button onClick={() => navigateTo('')} className="text-xs bg-slate-800 px-4 py-2 rounded hover:text-white transition-colors">Return to Root</button>
-                </div>
+                <ErrorState
+                  title="Access Denied / Error"
+                  message={error}
+                  actionLabel="Return to Root"
+                  onAction={() => navigateTo('')}
+                />
             ) : (
                 <div className="max-w-7xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
                     
@@ -336,10 +382,11 @@ export default function MemoryBrowser() {
                     )}
                     
                     {!loading && !data.children?.length && !node && (
-                        <div className="flex flex-col items-center justify-center py-20 text-slate-600 gap-4">
-                            <Folder size={48} className="opacity-20" />
-                            <p className="text-sm">Empty Sector</p>
-                        </div>
+                        <EmptyState
+                          icon={Folder}
+                          title="Empty Sector"
+                          description="No memories here yet. Create one through the MCP server or navigate to another domain."
+                        />
                     )}
                 </div>
             )}
