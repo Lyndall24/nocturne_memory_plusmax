@@ -20,7 +20,7 @@ async def up(engine: AsyncEngine):
                 dependency  INTEGER NOT NULL DEFAULT 1,
                 expression  INTEGER NOT NULL DEFAULT 1,
                 note        TEXT,
-                updated_at  TIMESTAMP DEFAULT NOW()
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         ))
