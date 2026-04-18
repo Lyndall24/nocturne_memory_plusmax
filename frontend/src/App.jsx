@@ -8,6 +8,9 @@ import ReviewPage from './features/review/ReviewPage';
 import MemoryBrowser from './features/memory/MemoryBrowser';
 import MaintenancePage from './features/maintenance/MaintenancePage';
 import TokenAuth from './components/TokenAuth';
+import { ToastProvider } from './components/Toast';
+import { ConfirmProvider } from './components/ConfirmDialog';
+import { NamespaceProvider, useNamespace } from './context/NamespaceContext';
 import { AUTH_ERROR_EVENT, getNamespaces } from './lib/api';
 
 // ---------------------------------------------------------------------------
@@ -22,13 +25,9 @@ import { AUTH_ERROR_EVENT, getNamespaces } from './lib/api';
 // api.js attaches it as X-Namespace on every request.
 // ---------------------------------------------------------------------------
 function NamespaceSelector() {
+  const { namespace: selected, setNamespace } = useNamespace();
   const [knownNamespaces, setKnownNamespaces] = useState([]);
-  const [selected, setSelected] = useState(
-    () => localStorage.getItem('selected_namespace') ?? ''
-  );
-  const [inputValue, setInputValue] = useState(
-    () => localStorage.getItem('selected_namespace') ?? ''
-  );
+  const [inputValue, setInputValue] = useState(selected);
   const [showInput, setShowInput] = useState(false);
 
   useEffect(() => {
@@ -37,16 +36,14 @@ function NamespaceSelector() {
       .catch(() => setKnownNamespaces([]));
   }, []);
 
+  // Keep the input in sync if the namespace is changed elsewhere.
+  useEffect(() => {
+    setInputValue(selected);
+  }, [selected]);
+
   const applyNamespace = (ns) => {
-    const trimmed = ns.trim();
-    setSelected(trimmed);
-    setInputValue(trimmed);
-    if (trimmed) {
-      localStorage.setItem('selected_namespace', trimmed);
-    } else {
-      localStorage.removeItem('selected_namespace');
-    }
-    window.location.reload();
+    setNamespace(ns);
+    setShowInput(false);
   };
 
   const handleSelectChange = (e) => {
@@ -272,9 +269,15 @@ function App() {
   }
 
   return (
-    <BrowserRouter>
-      <Layout />
-    </BrowserRouter>
+    <NamespaceProvider>
+      <ToastProvider>
+        <ConfirmProvider>
+          <BrowserRouter>
+            <Layout />
+          </BrowserRouter>
+        </ConfirmProvider>
+      </ToastProvider>
+    </NamespaceProvider>
   );
 }
 

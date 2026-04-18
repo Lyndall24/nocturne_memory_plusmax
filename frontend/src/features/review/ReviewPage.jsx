@@ -2,6 +2,8 @@ import React, { useEffect, useState, useRef } from 'react';
 import { getGroups, getGroupDiff, rollbackGroup, approveGroup, clearAll } from '../../lib/api';
 import SnapshotList from '../../components/SnapshotList';
 import DiffViewer from '../../components/DiffViewer';
+import { useToast } from '../../components/Toast';
+import { useConfirm } from '../../components/ConfirmDialog';
 import {
   Activity,
   Check,
@@ -18,6 +20,9 @@ import {
 import clsx from 'clsx';
 
 function ReviewPage() {
+  const toast = useToast();
+  const confirm = useConfirm();
+
   const [changes, setChanges] = useState([]);
   const [selectedChange, setSelectedChange] = useState(null);
   const [diffData, setDiffData] = useState(null);
@@ -72,16 +77,23 @@ function ReviewPage() {
 
   const handleRollback = async () => {
     if (!selectedChange) return;
-    if (!confirm(`Reject changes for node group ${selectedChange.display_uri}? This will revert the memory state.`)) return;
+    const ok = await confirm({
+      title: 'Reject changes?',
+      message: `Reject changes for node group ${selectedChange.display_uri}? This will revert the memory state.`,
+      confirmLabel: 'Reject',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       const res = await rollbackGroup(selectedChange.node_uuid);
       if (res && res.success === false) {
         throw new Error(res.message || "Unknown error during rollback");
       }
       await loadChanges();
+      toast.success('Changes rejected');
     } catch (err) {
       const errorMsg = err.response?.data?.detail || err.message;
-      alert("Rejection failed: " + errorMsg);
+      toast.error("Rejection failed: " + errorMsg);
     }
   };
 
@@ -90,20 +102,27 @@ function ReviewPage() {
     try {
       await approveGroup(selectedChange.node_uuid);
       await loadChanges();
+      toast.success('Changes integrated');
     } catch (err) {
-      alert("Integration failed: " + err.message);
+      toast.error("Integration failed: " + (err.response?.data?.detail || err.message));
     }
   };
 
   const handleClearAll = async () => {
-    if (!confirm("Integrate ALL pending memories?")) return;
+    const ok = await confirm({
+      title: 'Integrate all pending changes?',
+      message: 'This approves every pending memory change across all namespaces.',
+      confirmLabel: 'Integrate All',
+    });
+    if (!ok) return;
     try {
       await clearAll();
       setChanges([]);
       setSelectedChange(null);
       setDiffData(null);
+      toast.success('All changes integrated');
     } catch (err) {
-      alert("Mass integration failed: " + err.message);
+      toast.error("Mass integration failed: " + (err.response?.data?.detail || err.message));
     }
   };
 
