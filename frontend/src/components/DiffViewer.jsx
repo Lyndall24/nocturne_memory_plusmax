@@ -10,8 +10,8 @@ const DiffViewer = ({ oldText, newText }) => {
   return (
     <div className="w-full font-sans text-sm leading-7">
       {!hasChanges && (
-        <div className="text-slate-500 italic p-4 text-center border border-dashed border-slate-800 rounded-lg">
-          No changes detected in content.
+        <div className="text-fg-3 italic p-4 text-center border border-dashed border-line rounded-card">
+          内容无变更
         </div>
       )}
 
@@ -19,26 +19,41 @@ const DiffViewer = ({ oldText, newText }) => {
         {diff.map((part, index) => {
           if (part.removed) {
             return (
-              <div key={index} className="group relative bg-red-950/20 hover:bg-red-950/30 transition-colors border-l-2 border-red-900/50 pl-4 pr-2 py-1 select-text">
-                <div className="absolute left-0 top-0 bottom-0 w-[2px] bg-red-800 opacity-50 group-hover:opacity-100 transition-opacity"></div>
-                <span className="text-red-300/50 line-through decoration-red-800/50 font-mono text-xs block mb-1 opacity-50 select-none">REMOVED</span>
-                <span className="text-red-200/60 font-serif whitespace-pre-wrap">{part.value}</span>
+              <div
+                key={index}
+                className="group relative bg-danger-500/8 hover:bg-danger-500/12 transition-colors border-l-2 border-danger-500/40 pl-4 pr-2 py-1 select-text"
+              >
+                <span className="text-danger-400/50 font-mono text-xs block mb-1 select-none uppercase tracking-wider">
+                  已删除
+                </span>
+                <span className="text-danger-300/60 font-mono whitespace-pre-wrap line-through decoration-danger-500/30">
+                  {part.value}
+                </span>
               </div>
             );
           }
-          
+
           if (part.added) {
             return (
-               <div key={index} className="group relative bg-emerald-950/20 hover:bg-emerald-950/30 transition-colors border-l-2 border-emerald-500/50 pl-4 pr-2 py-2 my-1 rounded-r select-text">
-                 <div className="absolute left-0 top-0 bottom-0 w-[2px] bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.3)]"></div>
-                 <span className="text-emerald-500/50 font-mono text-xs block mb-1 opacity-70 select-none">ADDED</span>
-                 <span className="text-emerald-100 font-medium font-serif whitespace-pre-wrap">{part.value}</span>
-               </div>
+              <div
+                key={index}
+                className="group relative bg-success-500/8 hover:bg-success-500/12 transition-colors border-l-2 border-success-500/50 pl-4 pr-2 py-2 my-1 rounded-r select-text"
+              >
+                <span className="text-success-400/60 font-mono text-xs block mb-1 select-none uppercase tracking-wider">
+                  已新增
+                </span>
+                <span className="text-success-300 font-mono whitespace-pre-wrap">
+                  {part.value}
+                </span>
+              </div>
             );
           }
 
           return (
-            <div key={index} className="pl-4 pr-2 py-1 text-slate-400 whitespace-pre-wrap hover:text-slate-300 transition-colors border-l-2 border-transparent">
+            <div
+              key={index}
+              className="pl-4 pr-2 py-1 text-fg-2 font-mono whitespace-pre-wrap hover:text-fg-1 transition-colors border-l-2 border-transparent"
+            >
               {part.value}
             </div>
           );
