@@ -22,7 +22,7 @@ const KeywordManager = ({ keywords, nodeUuid, onUpdate }) => {
       setAdding(false);
       onUpdate();
     } catch (err) {
-      toast.error('Failed to add keyword: ' + (err.response?.data?.detail || err.message));
+      toast.error('添加词条失败：' + (err.response?.data?.detail || err.message));
     }
   };
 
@@ -32,7 +32,7 @@ const KeywordManager = ({ keywords, nodeUuid, onUpdate }) => {
       await api.delete('/browse/glossary', { data: { keyword: kw, node_uuid: nodeUuid } });
       onUpdate();
     } catch (err) {
-      toast.error('Failed to remove keyword: ' + (err.response?.data?.detail || err.message));
+      toast.error('删除词条失败：' + (err.response?.data?.detail || err.message));
     }
   };
 
@@ -42,19 +42,20 @@ const KeywordManager = ({ keywords, nodeUuid, onUpdate }) => {
   };
 
   return (
-    <div className="flex items-start gap-2 text-xs text-slate-500">
-      <Tag size={13} className="flex-shrink-0 mt-0.5 text-amber-700" />
+    <div className="flex items-start gap-2 text-xs text-fg-3">
+      <Tag size={13} className="flex-shrink-0 mt-0.5 text-warn-500/70" />
       <div className="flex flex-wrap gap-1.5 items-center">
-        <span className="text-amber-700 font-medium">Glossary:</span>
+        <span className="text-warn-500/70 font-medium">词表：</span>
         {keywords.map(kw => (
           <span
             key={kw}
-            className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-amber-950/30 border border-amber-800/30 rounded text-amber-400/80 font-mono text-[11px]"
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-warn-500/10 border border-warn-500/25 rounded-pill text-warn-400/80 font-mono text-xs"
           >
             {kw}
             <button
               onClick={() => handleRemove(kw)}
-              className="text-amber-700 hover:text-amber-400 transition-colors"
+              className="text-warn-500/50 hover:text-warn-400 transition-colors focus-visible:outline-none"
+              aria-label={`删除 ${kw}`}
             >
               <X size={9} />
             </button>
@@ -69,19 +70,23 @@ const KeywordManager = ({ keywords, nodeUuid, onUpdate }) => {
               onChange={e => setNewKeyword(e.target.value)}
               onKeyDown={handleKeyDown}
               onBlur={() => { if (!newKeyword.trim()) setAdding(false); }}
-              placeholder="keyword..."
-              className="w-28 px-1.5 py-0.5 bg-slate-900 border border-amber-800/40 rounded text-amber-300 text-[11px] font-mono focus:outline-none focus:border-amber-500/50"
+              placeholder="输入词条…"
+              className="w-28 px-1.5 py-0.5 bg-surface-2 border border-warn-500/30 rounded-control text-warn-300 text-xs font-mono focus:outline-none focus:border-warn-500/50 focus-visible:ring-1 focus-visible:ring-warn-500/40"
             />
-            <button onClick={handleAdd} className="text-amber-600 hover:text-amber-400 transition-colors">
+            <button
+              onClick={handleAdd}
+              className="text-warn-500/60 hover:text-warn-400 transition-colors focus-visible:outline-none"
+              aria-label="确认添加"
+            >
               <Save size={11} />
             </button>
           </span>
         ) : (
           <button
             onClick={() => setAdding(true)}
-            className="inline-flex items-center gap-0.5 px-1.5 py-0.5 border border-dashed border-amber-800/30 rounded text-amber-700 hover:text-amber-400 hover:border-amber-600/40 transition-colors text-[11px]"
+            className="inline-flex items-center gap-0.5 px-1.5 py-0.5 border border-dashed border-warn-500/25 rounded-pill text-warn-500/50 hover:text-warn-400 hover:border-warn-500/40 transition-colors text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-warn-500/40"
           >
-            <Plus size={9} /> add
+            <Plus size={9} /> 添加
           </button>
         )}
       </div>
