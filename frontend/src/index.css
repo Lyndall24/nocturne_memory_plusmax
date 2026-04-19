@@ -2,18 +2,44 @@
 @tailwind components;
 @tailwind utilities;
 
+@layer base {
+  html, body, #root {
+    @apply h-full;
+  }
+  body {
+    @apply bg-surface-0 text-fg-0 font-sans antialiased;
+  }
+  /* Native form controls render with the system color scheme; tell the browser we're dark
+     so dropdown/option backgrounds and scrollbars come out correct. */
+  :root {
+    color-scheme: dark;
+  }
+}
+
 /* Custom Scrollbar */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: #0f172a; 
+  background: #0A0B13; /* surface-1 */
 }
 ::-webkit-scrollbar-thumb {
-  background: #334155; 
+  background: #181A26; /* surface-3 */
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #475569; 
+  background: #2a2d3d;
+}
+
+/* Honor user's reduce-motion preference globally. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0s !important;
+    scroll-behavior: auto !important;
+  }
 }
